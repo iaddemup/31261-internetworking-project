@@ -9,12 +9,15 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 import pprint, pickle
+import pandas as pd
 
 #import OCBdataset pickle file and load into variable, creates tuple of igraph.Graph objects
 OCBdataset = pickle.load(open(r"data\OCBdataset\ckt_bench_101.pkl", 'rb'))
 OCBtensorset = pickle.load(open(r"data\OCBdataset\ckt_bench_101_tensor.pkl", 'rb'))
 OCBpygraphset = pickle.load(open(r"data\OCBdataset\ckt_bench_101_pygraph.pkl", 'rb'))
-OCBtestset = open(r"data\OCBdataset\perform101.csv", 'rb')
+
+#import perform101.csv for ground-truth values
+csv = pd.read_csv(r"data\OCBdataset\perform101.csv")
 
 #create GraphDataset object and define the constructor method
 class GraphDataset(Data):
@@ -34,41 +37,33 @@ testingDataset = OCBdataset[1]
 gTrain = []
 gTest = []
 
-for richGraph, simpleGraph in trainingDataset:
-    c = torch.tensor(richGraph.vs['c'])
-    gm = torch.tensor(richGraph.vs['gm'])
-    pos = torch.tensor(richGraph.vs['pos'])
-    r = torch.tensor(richGraph.vs['r'])
-    type = torch.tensor(richGraph.vs['type'])
-    vid = torch.tensor(richGraph.vs['vid'])
+for index, (richGraph, simpleGraph) in enumerate(trainingDataset):
+    c = torch.tensor(richGraph.vs['c'], dtype=torch.float32)
+    gm = torch.tensor(richGraph.vs['gm'], dtype=torch.float32)
+    pos = torch.tensor(richGraph.vs['pos'], dtype=torch.float32)
+    r = torch.tensor(richGraph.vs['r'], dtype=torch.float32)
+    type = torch.tensor(richGraph.vs['type'], dtype=torch.long)
+    vid = torch.tensor(richGraph.vs['vid'], dtype=torch.float32)
     edge_index = torch.tensor(richGraph.get_edgelist(), dtype=torch.long).permute(1, 0)
-    y = torch.tensor([richGraph.vcount()], dtype=torch.float32)
+    y = torch.tensor(csv.loc[index, ['gain', 'pm', 'bw', 'fom']].values, dtype=torch.float32)
     richGraph_pyg = GraphDataset(c=c, gm=gm, pos=pos, r=r, type=type, vid=vid, edge_index=edge_index, y=y)
     gTrain.append(richGraph_pyg)
 
-for richGraph, simpleGraph in testingDataset:
-    c = torch.tensor(richGraph.vs['c'])
-    gm = torch.tensor(richGraph.vs['gm'])
-    pos = torch.tensor(richGraph.vs['pos'])
-    r = torch.tensor(richGraph.vs['r'])    
-    type = torch.tensor(richGraph.vs['type'])
-    vid = torch.tensor(richGraph.vs['vid'])
+for index, (richGraph, simpleGraph) in enumerate(testingDataset):
+    c = torch.tensor(richGraph.vs['c'], dtype=torch.float32)
+    gm = torch.tensor(richGraph.vs['gm'], dtype=torch.float32)
+    pos = torch.tensor(richGraph.vs['pos'], dtype=torch.float32)
+    r = torch.tensor(richGraph.vs['r'], dtype=torch.float32)    
+    type = torch.tensor(richGraph.vs['type'], dtype=torch.long)
+    vid = torch.tensor(richGraph.vs['vid'], dtype=torch.float32)
     edge_index = torch.tensor(richGraph.get_edgelist(), dtype=torch.long).permute(1, 0)
-    y = torch.tensor([richGraph.vcount()], dtype=torch.float32)
+    y = torch.tensor(csv.loc[len(trainingDataset) + index, ['gain', 'pm', 'bw', 'fom']].values, dtype=torch.float32)
     richGraph_pyg = GraphDataset(c=c, gm=gm, pos=pos, r=r, type=type, vid=vid, edge_index=edge_index, y=y)
     gTest.append(richGraph_pyg)
 
 
-trainDataloader = DataLoader(gTrain, batch_size=2)
-testDataloader = DataLoader(gTest, batch_size=2)
-
-#debugging check 
-for batch in trainDataloader:
-    print(batch)
-    print("Node feature shape:", batch.x.shape if batch.x is not None else "None")
-    print("Edge index shape:", batch.edge_index.shape)
-    print("Target shape:", batch.y.shape)
-    break
+trainDataloader = DataLoader(gTrain, batch_size=32)
+testDataloader = DataLoader(gTest, batch_size=32)
 
 
 #create Model object and define constructor method
@@ -77,13 +72,13 @@ class Model(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(input_dim, hidden_dim)
         self.linear2 = nn.Linear(input_dim, hidden_dim)
-        self.gcn = GCN(hidden_dim*2, hidden_dim, num_layers, dropout=0.2, act='relu')
-        self.out = nn.Linear(hidden_dim, 1)
+        #self.gcn = GCN(hidden_dim*2, hidden_dim, num_layers, dropout=0.2, act='relu')
+        self.out = nn.Linear(hidden_dim, 4)
     
     #define forward method
     def forward(self, batch_data, device):
-        x_t = F.one_hot(batch_data.type, num_classes=14).to(torch.float32)
-        x_num = torch.stack([c, gm, pos, r], dim=-1).to(torch.float32)
+        x_t = F.one_hot(batch_data.type, num_classes=25).to(torch.float32) #need to figure out exactly how many type values there can be, or else one-hot won't work
+        x_num = torch.stack([batch_data.c, batch_data.gm, batch_data.pos, batch_data.r, batch_data.vid], dim=-1).to(torch.float32)
         e = batch_data.edge_index
 
         x_t = self.linear1(x_t)  #(B*N, dx)
@@ -118,3 +113,7 @@ for i in range(0, epochs):
         loss.backward()
         optimizer.step()
         print(loss.item())
+
+
+#predictions = model(graph_batch)
+#pd.DataFrame(predictions, columns=["valid", "gain", "pm", "bw", "fom"]).to_csv("predictions.csv", index=False)
