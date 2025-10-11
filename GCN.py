@@ -13,8 +13,6 @@ import pandas as pd
 
 #import OCBdataset pickle file and load into variable, creates tuple of igraph.Graph objects
 OCBdataset = pickle.load(open(r"data\OCBdataset\ckt_bench_101.pkl", 'rb'))
-OCBtensorset = pickle.load(open(r"data\OCBdataset\ckt_bench_101_tensor.pkl", 'rb'))
-OCBpygraphset = pickle.load(open(r"data\OCBdataset\ckt_bench_101_pygraph.pkl", 'rb'))
 
 #import perform101.csv for ground-truth values
 csv = pd.read_csv(r"data\OCBdataset\perform101.csv")
@@ -33,6 +31,11 @@ class GraphDataset(Data):
 trainingDataset = OCBdataset[0]
 testingDataset = OCBdataset[1]
 
+max_node_types = 0
+for (richGraph, _) in trainingDataset + testingDataset:
+    max_node_types = max(max_node_types, max(richGraph.vs['type']))
+max_node_types += 1
+
 #create array and tensorise graph information to create Data object to place in array
 gTrain = []
 gTest = []
@@ -45,7 +48,7 @@ for index, (richGraph, simpleGraph) in enumerate(trainingDataset):
     type = torch.tensor(richGraph.vs['type'], dtype=torch.long)
     vid = torch.tensor(richGraph.vs['vid'], dtype=torch.float32)
     edge_index = torch.tensor(richGraph.get_edgelist(), dtype=torch.long).permute(1, 0)
-    y = torch.tensor(csv.loc[index, ['gain', 'pm', 'bw', 'fom']].values, dtype=torch.float32)
+    y = torch.tensor(csv.loc[index, ['gain', 'pm', 'bw', 'fom']].values, dtype=torch.float32).unsqueeze(0)
     richGraph_pyg = GraphDataset(c=c, gm=gm, pos=pos, r=r, type=type, vid=vid, edge_index=edge_index, y=y)
     gTrain.append(richGraph_pyg)
 
@@ -57,27 +60,27 @@ for index, (richGraph, simpleGraph) in enumerate(testingDataset):
     type = torch.tensor(richGraph.vs['type'], dtype=torch.long)
     vid = torch.tensor(richGraph.vs['vid'], dtype=torch.float32)
     edge_index = torch.tensor(richGraph.get_edgelist(), dtype=torch.long).permute(1, 0)
-    y = torch.tensor(csv.loc[len(trainingDataset) + index, ['gain', 'pm', 'bw', 'fom']].values, dtype=torch.float32)
+    y = torch.tensor(csv.loc[len(trainingDataset) + index, ['gain', 'pm', 'bw', 'fom']].values, dtype=torch.float32).unsqueeze(0)
     richGraph_pyg = GraphDataset(c=c, gm=gm, pos=pos, r=r, type=type, vid=vid, edge_index=edge_index, y=y)
     gTest.append(richGraph_pyg)
 
+batch_size = 30
 
-trainDataloader = DataLoader(gTrain, batch_size=32)
-testDataloader = DataLoader(gTest, batch_size=32)
-
+trainDataloader = DataLoader(gTrain, batch_size, shuffle=True)
+testDataloader = DataLoader(gTest, batch_size)
 
 #create Model object and define constructor method
-class Model(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers):
+class GNN(nn.Module):
+    def __init__(self, hidden_dim, num_layers):
         super().__init__()
-        self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.linear2 = nn.Linear(input_dim, hidden_dim)
-        #self.gcn = GCN(hidden_dim*2, hidden_dim, num_layers, dropout=0.2, act='relu')
+        self.linear1 = nn.Linear(max_node_types, hidden_dim)
+        self.linear2 = nn.Linear(5, hidden_dim)
+        self.gcn = GCN(hidden_dim*2, hidden_dim, num_layers, dropout=0.2, act='relu')
         self.out = nn.Linear(hidden_dim, 4)
     
     #define forward method
     def forward(self, batch_data, device):
-        x_t = F.one_hot(batch_data.type, num_classes=25).to(torch.float32) #need to figure out exactly how many type values there can be, or else one-hot won't work
+        x_t = F.one_hot(batch_data.type, max_node_types).to(torch.float32)
         x_num = torch.stack([batch_data.c, batch_data.gm, batch_data.pos, batch_data.r, batch_data.vid], dim=-1).to(torch.float32)
         e = batch_data.edge_index
 
@@ -92,28 +95,69 @@ class Model(nn.Module):
         z = global_mean_pool(z, batch_data.batch)
         pred = self.out(z)
         return pred
+    
+    def training(dataloader, model, loss_fn, optimizer, device):
+        model.train()
+        size = len(dataloader.dataset)
+
+        for i, batch_data in enumerate(dataloader):
+            batch_data.to(device)
+            
+            #Compute prediction error
+            pred = model(batch_data, device)
+            loss = loss_fn(pred, batch_data.y)
+            
+            #Backpropagation
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+            if(i + 1) % 30 == 0:
+                loss, current = loss.item(), (i + 1) * len(batch_data)
+                print(f"Loss: {loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+    def testing(dataloader, model, loss_fn, device):
+        model.eval()
+        num_batches = len(dataloader)
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            for i, batch_data in enumerate(dataloader):
+                batch_data.to(device)
+                pred = model(batch_data, device)
+                loss = loss_fn(pred, batch_data.y)
+                total_loss += loss.item()
+        
+        avg_loss = total_loss / num_batches
+        print(f"Test Loss ({loss_fn.__class__.__name__}): {avg_loss:.6f}")
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+hidden_dim = 25
+num_layers = 5
+
+model = GNN(hidden_dim, num_layers).to(device)
+print("Would you like to load in previous learnings?")
+if input() == "Yes":
+    try:
+        model.load_state_dict(torch.load("model.pth", weights_only=True))
+        print(f"The following model was found in directory: \n {model}")
+    except:
+        print("No saved model detected.")
+
+MSE = nn.MSELoss()
+ADAM = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 epochs = 10
-input_dim = 3
-hidden_dim = 16
-num_layers = 3
-# If you run under Nvidia GPU have cuda installed, you could accelerate the computation through GPU
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = Model(input_dim, hidden_dim, num_layers).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-criterion = nn.MSELoss()
 
-for i in range(0, epochs):
-    print(f"------------------ epoch_{i} -----------------")
-    for i, batch_data in enumerate(trainDataloader):
-        batch_data.to(device)
-        optimizer.zero_grad()
-        pred = model(batch_data, device)
-        loss = criterion(pred.squeeze(), batch_data.y)
-        loss.backward()
-        optimizer.step()
-        print(loss.item())
+for i in range(epochs):
+    print(f"Epoch {i+1}\n-------------------------------")
+    GNN.training(trainDataloader, model, MSE, ADAM, device)
+    GNN.testing(testDataloader, model, MSE, device)
+    print("\n")
 
-
-#predictions = model(graph_batch)
-#pd.DataFrame(predictions, columns=["valid", "gain", "pm", "bw", "fom"]).to_csv("predictions.csv", index=False)
+print("Would you like to save these learnings?")
+if input() == "Yes":
+    torch.save(model.state_dict(), "model.pth")
+    print("Saved PyTorch Model State to model.pth")
